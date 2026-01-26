@@ -1,0 +1,235 @@
+---
+title: "Session Detach"
+---
+
+Author(s): [@chazcb](https://github.com/chazcb)
+
+## Elevator pitch
+
+> What are you proposing to change?
+
+Add a `session/detach` method that allows clients to stop receiving updates for a session without ending it. This enables clients to manage multiple sessions over a single connection by selectively listening to only the sessions they're actively interested in.
+
+## Status quo
+
+> How do things work today and what problems does this cause? Why would we change things?
+
+Currently, ACP provides session lifecycle methods:
+
+- `session/new` - Create a new session and start receiving updates
+- `session/load` - Attach to an existing session and start receiving updates
+
+Once attached to a session, the client receives all `session/update` events until... when? There's no explicit way to say "stop sending me updates for this session."
+
+This creates problems for clients managing multiple sessions over a single connection:
+
+1. **No way to stop updates** - Once a session is created or loaded, the client receives all updates indefinitely. There's no way to say "I don't need updates for this session right now."
+
+2. **Resource waste** - A client with 10 open sessions receives updates for all 10, even if the user is only actively viewing one. This wastes bandwidth and processing.
+
+3. **Multi-session UX** - IDEs and rich clients often want to maintain multiple sessions (different projects, different conversations) but only show one at a time. Currently they must either:
+   - Keep receiving all updates (wasteful)
+   - Open separate connections per session (complex, resource-heavy)
+
+4. **Background sessions** - Some sessions might be running long tasks in the background. The client wants to let them run but not receive streaming updates until the user switches back to that session.
+
+## What we propose to do about it
+
+> What are you proposing to improve the situation?
+
+Add a `session/detach` method that tells the agent to stop sending updates for a specific session:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "session/detach",
+  "params": {
+    "sessionId": "session-123"
+  }
+}
+```
+
+The agent acknowledges and stops sending events for that session:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {}
+}
+```
+
+To resume receiving updates, the client can use either `session/load` or `session/resume`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "session/resume",
+  "params": {
+    "sessionId": "session-123",
+    "cwd": "/path/to/project"
+  }
+}
+```
+
+Using `session/resume` is preferred after detach since the client already has the message history - no need to replay it. Use `session/load` if you need the full history (e.g., different client instance).
+
+## Shiny future
+
+> How will things will play out once this feature exists?
+
+**Session lifecycle becomes:**
+
+```
+session/new ──► [attached, receiving updates]
+                        │
+                        ▼
+              session/detach ──► [detached, no updates]
+                        │                │
+                        │                ├── session/resume ──► [re-attached, no history]
+                        │                │
+                        │                └── session/load ──► [re-attached, with history]
+                        │
+                        ▼
+                  [session continues to exist]
+```
+
+**For Clients:**
+- Create sessions with `session/new`
+- Switch away from a session with `session/detach` (stops updates, session continues)
+- Switch back with `session/resume` (resumes updates, no history replay)
+- Or switch back with `session/load` (resumes updates, replays full history)
+- Manage multiple sessions efficiently over a single connection
+
+**For Agents:**
+- Track which sessions are "attached" (client wants updates)
+- Stop sending `session/update` events for detached sessions
+- Continue processing for detached sessions if work is in progress
+- Resume sending events when client re-attaches via `session/load`
+
+**Multi-session workflow example:**
+
+```
+Client                              Agent
+  │                                   │
+  ├─── session/new (A) ──────────────►│  Create session A
+  │◄── session/update for A ──────────│
+  │                                   │
+  ├─── session/new (B) ──────────────►│  Create session B
+  │◄── session/update for A and B ────│
+  │                                   │
+  ├─── session/detach (A) ───────────►│  Stop updates for A
+  │◄── session/update for B only ─────│  (A continues if working)
+  │                                   │
+  ├─── session/load (A) ─────────────►│  Re-attach to A
+  │◄── session/update for A and B ────│
+```
+
+## Implementation details and plan
+
+> Tell me more about your implementation. What is your detailed implementation plan?
+
+### Schema
+
+```typescript
+interface DetachSessionRequest {
+  sessionId: string;
+}
+
+interface DetachSessionResponse {
+  // Empty on success
+}
+```
+
+### Behavior specification
+
+**On `session/detach`:**
+1. Agent stops sending all `session/update` events for the specified session
+2. If the session has work in progress, it MAY continue running
+3. Agent MUST NOT send any events for the detached session
+4. The session remains valid and can be re-attached via `session/load`
+
+**On `session/resume` or `session/load` (re-attach):**
+1. Agent resumes sending events for the session
+2. Response includes current session state
+3. Any work completed while detached is reflected in the state
+4. `session/resume` omits message history; `session/load` includes it
+
+**Edge cases:**
+- Detaching an already-detached session: Success (idempotent)
+- Detaching a non-existent session: Error
+- Loading a session that was never detached: Works normally (idempotent attach)
+
+### Open questions
+
+**Should detached sessions continue processing?**
+
+Option A: **Yes, continue processing** (proposed)
+- Long-running tasks complete in background
+- Client re-attaches to see results
+- Pro: Better UX for background work
+- Con: Resource usage for "forgotten" sessions
+
+Option B: **No, pause processing**
+- Detach also pauses any in-progress work
+- Work resumes on re-attach
+- Pro: Clear resource management
+- Con: Complicates agent implementation
+
+Option C: **Agent decides**
+- Behavior is implementation-defined
+- Pro: Flexibility
+- Con: Inconsistent client experience
+
+**Should there be a "detach all" convenience method?**
+
+When switching to a single session, clients might want to detach all others in one call rather than N individual detach calls.
+
+### Implementation phases
+
+**Phase 1: Schema**
+- Add `session/detach` method to protocol schema
+- Define request/response types
+
+**Phase 2: Agent support**
+- Implement detach tracking in reference agent
+- Ensure events are filtered for detached sessions
+
+**Phase 3: Client support**
+- Update SDKs with detach method
+- Add examples for multi-session management
+
+## Frequently asked questions
+
+> What questions have arisen over the course of authoring this document or during subsequent discussions?
+
+### How is this different from `session/cancel`?
+
+`session/cancel` cancels an in-progress operation within a session. `session/detach` stops the flow of updates to the client but doesn't cancel anything - work can continue in the background.
+
+### How does this relate to `session/resume`?
+
+`session/resume` (unstable) is the lightweight counterpart to `session/load` - it re-attaches to a session without replaying message history. This pairs naturally with `session/detach`:
+
+- **Detach → Resume**: Client already has history, just needs to start receiving updates again
+- **Detach → Load**: Client needs full history (different client instance, or client cleared local state)
+
+For typical "tab switching" use cases, the pattern is `detach` then `resume`.
+
+### How does this relate to session persistence?
+
+Session persistence (saving/loading sessions across agent restarts) is orthogonal. A detached session is still in-memory and active - it's just not sending updates to the client. Persistence is about surviving agent restarts.
+
+### What happens to queued events while detached?
+
+Events are not queued. When detached, events simply aren't generated/sent for that session. On re-attach, the client gets current state via `session/load` response, which reflects any changes that occurred while detached.
+
+### Can a session be attached to multiple clients?
+
+This RFD doesn't address multi-client scenarios. The assumption is one client per connection, potentially managing multiple sessions. Multi-client session sharing would be a separate proposal.
+
+## Revision history
+
+- 2025-01-26: Initial draft
